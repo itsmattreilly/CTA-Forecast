@@ -1,0 +1,224 @@
+---
+title: "  L Station Ridership Forecast"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    layout: fill
+    logo: imgs/chi_flag.png
+    css: css/styles_chi.css
+runtime: shiny
+---
+
+Column {.sidebar}
+-----------------------------------------------------------------------
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(flexdashboard)
+library(shiny)
+library(shinyjs)
+library(shinyWidgets)
+library(tidyverse)
+library(tidymodels)
+library(lubridate)
+library(vip)
+library(leaflet)
+library(textrecipes)
+library(ggmap)
+library(zoo)
+library(xgboost)
+library(timetk)
+library(modeltime)
+library(plotly)
+library(ggplot2)
+library(ggthemes)
+library(shinydashboard)
+library(prophet)
+library(shinybusy)
+```
+
+
+```{css}
+.value-box {
+  width: 30px;
+  height: 150px;
+}
+```
+
+
+```{r}
+ridership <- read.csv('ridership.csv')
+location_data <- read.csv('locations.csv')
+ridership$date <- mdy(ridership$date)
+
+station_info <- location_data %>%
+  select(STATION_NAME, Location, MAP_ID) %>%
+  distinct(STATION_NAME, MAP_ID, Location) 
+
+station_info$Location <- gsub('^.|.$', '', station_info$Location)
+locations <- as.data.frame(str_split(station_info$Location, ',', simplify = TRUE))
+colnames(locations) <- c('Latitude', 'Longitude')
+
+locations$StationID <- station_info$MAP_ID
+locations$Latitude <- as.numeric(as.character(locations$Latitude))
+locations$Longitude <- as.numeric(as.character(locations$Longitude))
+locations$station_id <- as.numeric(as.character(locations$StationID))
+```
+
+```{r}
+stations_full <- left_join(ridership, locations) %>%
+  select(-station_id, -daytype) %>%
+  mutate(weekday  = wday(date, label = TRUE),
+         month = month(date),
+         year = year(date))
+```
+
+```{r}
+station_choices <- stations_full %>%
+  group_by(stationname) %>%
+  summarize(avg_riders = mean(rides)) %>%
+  arrange(desc(avg_riders)) %>%
+  top_n(50) %>%
+  filter(stationname != 'Roosevelt') %>%
+  select(stationname) 
+
+station_geo_summary <- stations_full %>%
+  group_by(stationname, Latitude, Longitude) %>%
+  count() %>%
+  rename(Station = stationname)
+```
+
+```{r}
+selectInput(inputId = "station_entry", label = h4("L Station"), choices = station_choices)
+sliderInput(inputId = "date_entry", label = h4("Future Forecast (days)"), min = 0, max = 730, value = 31)
+
+actionButton(inputId = "apply", label = "Apply", icon = icon(name = "play", lib = "font-awesome"))
+```
+
+```{r}
+br()
+p('Forecast may take ~1 min. to load')
+```
+
+
+
+```{r}
+lockdown_dates <- seq(as_date('2020-03-15'), as_date('2020-05-29'), by  = 1)
+lockdown <- data.frame(ds = lockdown_dates, holiday = "Lockdown")
+
+reopening_1_dates <- seq(as_date('2020-05-30'), as_date('2020-10-1'), by  = 1)
+reopening_1 <- data.frame(ds = reopening_1_dates, holiday = "Reopening 1")
+
+holiday <- rbind(lockdown, reopening_1)
+```
+
+
+```{r}
+df_station <- eventReactive(eventExpr = input$apply, valueExpr = {
+  station_chosen <- stations_full %>%
+    filter(stationname == input$station_entry) %>%
+    select(date, rides) %>%
+    rename(ds = date, y = rides)
+  
+  model1 <- prophet(station_chosen, holidays = holiday)
+  future1 <- make_future_dataframe(model1, periods = input$date_entry)
+  forecast1 <- predict(model1, future1)
+  
+  return(forecast1)
+  }
+)
+```
+
+Row {data-width=900}
+-----------------------------------------------------------------------
+
+```{r}
+add_busy_spinner(spin = "double-bounce", position = c("full-page"))
+
+center <- reactive({
+        subset(station_geo_summary, Station == input$station_entry)})
+
+summary_reactive <- eventReactive(eventExpr = input$apply, valueExpr = {
+  station_geo_summary})
+
+output$map <- renderLeaflet({
+        leaflet(summary_reactive()) %>%
+            addTiles() %>% 
+            setView(lng = center()$Longitude, lat = center()$Latitude, zoom = 11) %>% 
+            addCircleMarkers(summary_reactive()$Longitude, summary_reactive()$Latitude, 
+                             label = summary_reactive()$Station,
+                             radius = 0.7,
+                             color = '#181818') %>%
+            addCircleMarkers(center()$Longitude, lat = center()$Latitude,
+                             label = center()$Station,
+                             labelOptions = labelOptions(noHide = TRUE),
+                             radius = 0.7,
+                             color = 'red')
+    })
+
+leafletOutput('map')
+```
+
+```{r}
+output$plot_timeseries <- renderPlotly({
+  p <- df_station() %>%
+    select(ds, yhat) %>%
+   # mutate(wday = wday(ds)) %>%
+    mutate(roll = rollmean(yhat, k  = 10, fill = NA)) %>%
+    mutate(prediction = case_when(ds > '2022-02-01' ~ 1,
+                                               TRUE ~ 0)) %>%
+    filter(year(ds) > 2005) %>%
+    ggplot(aes(ds, yhat, color = prediction)) + geom_point(size = 0.05) +
+    geom_line(aes(ds, roll)) +
+    theme_fivethirtyeight() + 
+    scale_y_continuous(labels = comma_format()) + 
+    ggtitle("Train Ridership Forecast") + 
+    theme(panel.background = element_rect("white"),
+          plot.background = element_rect("white"),
+          legend.position = 'none')
+  
+  ggplotly(p)
+})
+
+plotlyOutput("plot_timeseries")
+
+```
+
+Row {data-width = 100}
+-----------------------------------------------------------------------
+```{r}
+final_day <- reactive({
+
+  final_date <- df_station()
+  modified_df <- data.frame(as.character(final_date$ds), as.numeric(final_date$yhat)) %>%
+    tail(1) 
+  colnames(modified_df) <- c("Date", "Forecasted Ridership")
+   
+  modified_df[1,1:2]
+})
+```
+
+### Date Forecast
+```{r}
+flexdashboard::renderValueBox({
+  flexdashboard::valueBox(
+        value = final_day()$Date, 
+        caption = "Date Forecast",
+        icon = "fa-clock")
+})
+```
+
+### Ridership Prediction
+```{r}
+flexdashboard::renderValueBox({
+  flexdashboard::valueBox(
+        value = comma(round(final_day()$"Forecast", 2)),
+        caption = "Predicted Ridership",
+        icon = "fa-train")
+})
+
+```
+
+
+
+
